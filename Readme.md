@@ -1,3 +1,19 @@
+## 默认真机运行入口（含 JS 异常监控）
+
+从项目根目录执行 `./run-fastbot --minutes 10`。该入口准备本地工作区、安装本地 Pod、构建签名 Runner、采集目标进程日志，并运行 Fastbot。JS 异常命中时停止测试并返回失败；日志不可用时返回无法判定，不按成功处理。
+
+首次使用需要 Python 3.9+、CocoaPods、Xcode 和有效开发签名。若未找到 pymobiledevice3，入口会在 `.fastbot/venv` 安装固定版本的日志工具，需要联网。手机须已信任电脑并开启开发者模式。
+
+首次先将 `fastbot.example.json` 复制为 `fastbot.local.json` 并填写设备 UDID、App bundle ID、进程名和开发团队。设备配置保存在被忽略的 `fastbot.local.json`，也可通过 `--device`、`--bundle-id`、`--process`、`--team` 覆盖。`--process` 是进程名，不是 bundle ID。`--minutes` 默认 10，`--throttle` 默认 300 毫秒。`--pmd` 可指定已有日志工具；`--dry-run` 可只检查命令。
+
+日志、结果和构建产物保存在 `.fastbot/`，每次结果目录中包含 `run-summary.json`、`monitor/report.json`、设备日志、Fastbot 日志及 XCTest 结果。`no_js_error_observed` 只表示未命中日志特征，不保证所有 JS 异常都被捕获。
+
+日志流建立后才启动 Fastbot，避免漏采启动阶段日志。异常命中后立即停止操作，再保留两秒后续日志以捕获堆栈。`device.log` 为按目标进程过滤的 JSON Lines。
+
+原来的直接 `xcodebuild` 命令仍是底层入口，不会自动调用外部监控；日常验证请使用上面的统一入口。原上游说明如下。
+
+---
+
 ## Introduction
 Fastbot is a model-based testing tool for modeling GUI transitions to discover app stability problems. It combines machine learning and reinforcement learning techniques to assist discovery in a more intelligent way.
 > Related: [Fastbot_Android](https://github.com/bytedance/Fastbot_Android)

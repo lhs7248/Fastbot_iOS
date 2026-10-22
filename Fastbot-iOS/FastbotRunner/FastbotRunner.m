@@ -51,24 +51,23 @@
 {
     NSDictionary* startEnv = [[NSProcessInfo processInfo] environment];
     fastbot *fastbot_native = [[Fastbot_native alloc] init:startEnv];
+    // Register before starting so system permission alerts use their actual button frames.
+    [fastbot_native addUIInterruptionMonitor:^CGRect(NSArray<XCUIElement *> *alerts) {
+        NSArray<NSString *> *labels = @[@"使用App时允许", @"使用 App 时允许", @"使用应用时允许", @"允许一次", @"允许", @"Allow While Using App", @"Allow Once", @"Allow", @"好", @"OK"];
+        for (XCUIElement *alert in alerts) {
+            NSLog(@"PERMISSION_CALLBACK alert=%@", alert.label);
+            for (NSString *label in labels) {
+                XCUIElement *button = alert.buttons[label];
+                if (button.exists) {
+                    NSLog(@"PERMISSION_CALLBACK choose=%@ frame=%@", label, NSStringFromCGRect(button.frame));
+                    return button.frame;
+                }
+            }
+        }
+        return CGRectZero;
+    }];
     [fastbot_native start];
-    
-    // @notice you can uncomment this for some custom action when system alerts
-//    [fastbot_native addUIInterruptionMonitor:^CGRect(NSArray<XCUIElement *> *systemAlerts) {
-//        NSArray<XCUIElement*> *buttons = [systemAlerts.firstObject.buttons allElementsBoundByIndex];
-//        NSInteger buttonCount = [buttons count];
-//        CGRect btnRect = CGRectZero;
-//        if(buttonCount<=0)
-//            return btnRect;
-//        if(buttonCount > 2)
-//        {
-//            btnRect = [[buttons objectAtIndex:1] frame];
-//        }
-//        else
-//            btnRect = [buttons.lastObject frame];
-//        return btnRect;
-//    }];
-    
+
     [[NSRunLoop currentRunLoop] addPort:[NSPort port] forMode:NSDefaultRunLoopMode];
     while (self.shouldKeepRunning && [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate distantFuture]]);
 }

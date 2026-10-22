@@ -1,0 +1,8 @@
+{
+  "device": "YOUR_DEVICE_UDID",
+  "bundle_id": "com.example.app",
+  "process": "YourAppExecutable",
+  "team": "YOUR_DEVELOPMENT_TEAM",
+  "minutes": 10,
+  "throttle": 300
+}
