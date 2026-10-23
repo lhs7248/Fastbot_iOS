@@ -1,3 +1,37 @@
+## 本地源码引擎
+
+默认运行入口现已使用源码编译的 Android ModelReusableAgent + XCTest 无障碍元素树，不再依赖三个旧 Fastbot Framework。构建、边界和许可证说明见 [源码引擎说明](docs/source-engine.md)。
+
+```sh
+./run-fastbot --engine source --minutes 10 --sample-interval 5
+```
+
+保留 `--engine legacy` 用于对照。下方 upstream 文档描述的是原有二进制版本，不能等同于新源码模式的能力。
+
+## 内存采集与 HTML 报告
+
+统一入口现在默认同时采集 iOS `physFootprint` 和设备可用的 `memResidentSize`，无需改被测 App 或重新打包。日志工具通过 Instruments 用户态连接读取进程信息，手机需连接并开启开发者模式。物理占用与驻留内存分别保存，不做替代。
+
+```sh
+./run-fastbot --minutes 10 --sample-interval 5
+# 可选：明确设置仅用于提示的增长阈值（MiB/分钟和峰值/基线比值）
+./run-fastbot --minutes 10 --memory-growth-rate 1 --memory-growth-ratio 1.3
+```
+
+每轮新增 `performance/samples.jsonl`、`performance/memory.csv`、`performance/summary.json`、`performance/collector-summary.json`、`issues.json` 和 `report.html`。内存原始值以 bytes 保存，图表以 MiB 展示，包含源时间、接收时间、PID、进程分段和缺测原因。App 重启或 PID 复用会另起分段；图表不跨缺测点连线。初始连接、App 未运行及收尾可能出现缺测，报告会如实显示。
+
+报告将测试结果、日志质量和内存质量分别展示。没有有效内存数据、样本不足或有缺测，不会判成内存平稳。默认不启用未经验证的增长阈值；显式配置后也只给出“疑似增长”提示，不等同于泄漏证明。原生崩溃诊断尚未接入，不能通过 PID 变化断言崩溃。
+
+新增整轮退出码：`6` 表示测试完成但内存采集不完整/失败；`7` 表示报告生成失败。原有 JS 异常、采集失败和中止退出码继续保留。HTML 和 JSON 都会展示最终退出码。采样器和子进程由本轮入口统一停止，已产生的数据保留。
+
+可离线重新生成报告：
+
+```sh
+python3 tools/performance/report.py .fastbot/results/你的运行目录
+```
+
+完整 schema、采样质量和限制见 [内存报告说明](tools/performance/README.md)。
+
 ## 默认真机运行入口（含 JS 异常监控）
 
 从项目根目录执行 `./run-fastbot --minutes 10`。该入口准备本地工作区、安装本地 Pod、构建签名 Runner、采集目标进程日志，并运行 Fastbot。JS 异常命中时停止测试并返回失败；日志不可用时返回无法判定，不按成功处理。

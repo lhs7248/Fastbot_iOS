@@ -22,6 +22,11 @@
       </MacroExpansion>
       <EnvironmentVariables>
          <EnvironmentVariable
+            key = "FASTBOT_RUN_ID"
+            value = "${FASTBOT_RUN_ID}"
+            isEnabled = "YES">
+         </EnvironmentVariable>
+         <EnvironmentVariable
             key = "BUNDLEID"
             value = "${BUNDLEID}"
             isEnabled = "YES">

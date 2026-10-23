@@ -4,5 +4,7 @@
   "process": "YourAppExecutable",
   "team": "YOUR_DEVELOPMENT_TEAM",
   "minutes": 10,
-  "throttle": 300
+  "throttle": 300,
+  "sample_interval": 5,
+  "engine": "source"
 }

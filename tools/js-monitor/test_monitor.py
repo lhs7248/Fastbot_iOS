@@ -54,3 +54,39 @@ class MonitorProcessTests(unittest.TestCase):
   self.assertEqual(code,4)
 
 if __name__ == '__main__': unittest.main()
+
+class CooperativeStopTests(unittest.TestCase):
+ def test_waits_for_runner_finalization_instead_of_killing_it(self):
+  import pathlib,tempfile,subprocess,sys,json,contextlib,io,time
+  from unittest.mock import patch
+  import monitor
+  with tempfile.TemporaryDirectory() as d:
+   p=pathlib.Path(d);stop=p/'stop';final=p/'final';fake=p/'collector'
+   fake.write_text('#!'+sys.executable+'\nimport json,time\nprint(json.dumps({"filename":"/System/SpringBoard","message":"ready"}),flush=True)\ntime.sleep(.4)\nprint(json.dumps({"filename":"/App/app","message":"Unhandled JS Exception: Error: test"}),flush=True)\ntime.sleep(15)\n');fake.chmod(0o755)
+   runner="import pathlib,time; p=pathlib.Path(%r); end=time.monotonic()+10\nwhile not p.exists() and time.monotonic()<end: time.sleep(.05)\ntime.sleep(1)\npathlib.Path(%r).write_text('finalized')\nraise SystemExit(65)" % (str(stop),str(final))
+   def deliver(*args):stop.write_text('stop');return {'delivered':True,'method':'test_control_file'}
+   argv=['monitor','--pmd',str(fake),'--udid','fake','--process','app','--out',str(p/'out'),'--seconds','10','--source-run-id','run-1','--source-stop-grace','5','--run',sys.executable,'-c',runner]
+   with patch.object(sys,'argv',argv),patch('monitor.request_runner_stop',side_effect=deliver),contextlib.redirect_stdout(io.StringIO()):code=monitor.main()
+   report=json.loads((p/'out/report.json').read_text())
+   self.assertEqual(code,2);self.assertTrue(final.exists());self.assertEqual(report['testExitCode'],65)
+   self.assertFalse(report['stopRequest'].get('forcedTermination',False))
+ def test_control_path_rejects_traversal(self):
+  import tempfile,argparse,pathlib
+  from unittest.mock import patch
+  from monitor import request_runner_stop
+  with tempfile.TemporaryDirectory() as d,patch('monitor.subprocess.run') as copy:
+   result=request_runner_stop(argparse.Namespace(source_run_id='../bad'),pathlib.Path(d))
+   self.assertFalse(result['delivered']);copy.assert_not_called()
+
+class ForcedStopTests(unittest.TestCase):
+ def test_unresponsive_runner_is_stopped_after_bounded_grace(self):
+  import pathlib,tempfile,sys,json,contextlib,io
+  from unittest.mock import patch
+  import monitor
+  with tempfile.TemporaryDirectory() as d:
+   p=pathlib.Path(d);fake=p/'collector'
+   fake.write_text('#!'+sys.executable+'\nimport json,time\nprint(json.dumps({"filename":"/System/SpringBoard","message":"ready"}),flush=True)\ntime.sleep(.3)\nprint(json.dumps({"filename":"/App/app","message":"Unhandled JS Exception: Error: test"}),flush=True)\ntime.sleep(15)\n');fake.chmod(0o755)
+   argv=['monitor','--pmd',str(fake),'--udid','fake','--process','app','--out',str(p/'out'),'--seconds','10','--source-run-id','run-1','--source-stop-grace','.3','--run',sys.executable,'-c','import time;time.sleep(15)']
+   with patch.object(sys,'argv',argv),patch('monitor.request_runner_stop',return_value={'delivered':True}),contextlib.redirect_stdout(io.StringIO()):code=monitor.main()
+   r=json.loads((p/'out/report.json').read_text())
+   self.assertEqual(code,2);self.assertTrue(r['stopRequest']['forcedTermination']);self.assertNotEqual(r['testExitCode'],0)

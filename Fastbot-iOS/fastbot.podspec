@@ -33,7 +33,7 @@ Pod::Spec.new do |s|
   s.version          = '0.2.0'
   s.summary          = 'Fastbot-iOS'
   s.homepage         = 'https://github.com/bytedance/Fastbot-iOS'
-  s.license          = { :type => 'MIT', :file => '../LICENSE' }
+  s.license          = { :type => 'Fastbot Revised License', :file => '../LICENSE' }
   s.author           = { 'fastbot' => 'smart-qa@bytedance.com' }
   s.source           = { :git => 'git@github.com:bytedance/Fastbot_iOS.git', :tag => s.version.to_s }
 
@@ -57,4 +57,19 @@ Pod::Spec.new do |s|
     ss.vendored_frameworks = ['XCTest']
     ss.source_files = "fastbot-stub/*.{h,m,mm}"
   end
+  # Internal-use source port; see SourceEngine/core/UPSTREAM.md and retained license.
+  s.subspec 'source' do |ss|
+    ss.source_files = 'SourceEngine/**/*.{h,hpp,m,mm,cpp}'
+    ss.public_header_files = 'SourceEngine/FB*.h'
+    ss.header_mappings_dir = 'SourceEngine'
+    ss.frameworks = ['XCTest', 'QuartzCore']
+    ss.libraries = 'c++'
+    ss.pod_target_xcconfig = {
+      'CLANG_CXX_LANGUAGE_STANDARD' => 'c++14',
+      'HEADER_SEARCH_PATHS' => '$(inherited) "${PODS_TARGET_SRCROOT}/SourceEngine/core" "${PODS_TARGET_SRCROOT}/SourceEngine/core/agent" "${PODS_TARGET_SRCROOT}/SourceEngine/core/desc" "${PODS_TARGET_SRCROOT}/SourceEngine/core/desc/reuse" "${PODS_TARGET_SRCROOT}/SourceEngine/core/model" "${PODS_TARGET_SRCROOT}/SourceEngine/core/events" "${PODS_TARGET_SRCROOT}/SourceEngine/core/storage" "${PODS_TARGET_SRCROOT}/SourceEngine/core/thirdpart" "${PODS_TARGET_SRCROOT}/SourceEngine/core/thirdpart/json" "${PODS_TARGET_SRCROOT}/SourceEngine/core/thirdpart/tinyxml2"',
+      'GCC_PREPROCESSOR_DEFINITIONS' => '$(inherited) FASTBOT_SOURCE=1'
+    }
+    ss.user_target_xcconfig = { 'GCC_PREPROCESSOR_DEFINITIONS' => '$(inherited) FASTBOT_SOURCE=1' }
+  end
+
 end

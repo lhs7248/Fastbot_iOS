@@ -29,15 +29,11 @@ project 'Fastbot-iOS.xcodeproj'
 
 target 'FastbotRunner' do
   pod 'fastbot', :path => "./", :subspecs => [
-    'fastbot'
+    'source'
   ]
 end
 
 
 
 
-target 'fastbot_stub' do
-  pod "GCDWebServer", "~> 3.0"
-  pod "fastbot-stub", :path => "./"
-end
-
+# Injected legacy stub is not needed by the source XCTest runner.

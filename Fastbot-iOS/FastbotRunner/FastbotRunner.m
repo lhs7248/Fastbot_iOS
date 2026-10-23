@@ -1,3 +1,17 @@
+#if FASTBOT_SOURCE
+#import <XCTest/XCTest.h>
+#import "FBSourceExplorer.h"
+@interface FastbotRunner : XCTestCase
+@end
+@implementation FastbotRunner
+- (void)testFastbot {
+    self.continueAfterFailure=NO;
+    NSError *error=nil;
+    BOOL completed=[[FBSourceExplorer new] runWithTestCase:self environment:NSProcessInfo.processInfo.environment error:&error];
+    XCTAssertTrue(completed,@"%@",error.localizedDescription ?: @"Source exploration failed");
+}
+@end
+#else
 
 //MIT License
 //
@@ -97,3 +111,5 @@
 }
 
 @end
+
+#endif
