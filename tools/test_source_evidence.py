@@ -83,3 +83,35 @@ class SnapshotFailureTests(unittest.TestCase):
    result=recover_journal(j,out,'js_error')
    self.assertEqual(result['executed'],1);self.assertEqual(result['evidenceStatus'],'recovered_partial')
    self.assertFalse(result['snapshotAvailable']);self.assertIn('snapshotError',result)
+
+class ExplorationQualityTests(unittest.TestCase):
+ def test_round_trips_are_not_reported_as_new_coverage(self):
+  from source_evidence import summarize_events
+  rows=[]
+  for before,after in [('A','B'),('B','A'),('A','B'),('B','B'),('B','B')]:
+   rows.append(dict(kind='action',act='CLICK',executed=True,beforeFingerprint=before))
+   rows.append(dict(kind='action_effect',act='CLICK',beforeFingerprint=before,afterFingerprint=after,effect='changed' if before!=after else 'no_observable_change'))
+  rows += [dict(kind='exploration_pass'),dict(kind='exploration_pass'),dict(kind='summary',executed=5,rejected=0,progressCount=3,noEffectCount=2)]
+  result=summarize_events(rows)
+  self.assertEqual(result['observedContextCount'],2)
+  self.assertEqual(result['revisitedContextTransitions'],2)
+  self.assertEqual(result['maxConsecutiveNoEffect'],2)
+  self.assertEqual(result['explorationPassCount'],2)
+ def test_legacy_missing_fingerprints_are_unknown_not_zero_coverage(self):
+  from source_evidence import summarize_events
+  result=summarize_events([dict(kind='action',executed=True),dict(kind='summary',executed=1,rejected=0)])
+  self.assertIsNone(result['observedContextCount'])
+  self.assertIsNone(result['revisitedContextTransitions'])
+
+class TargetResolutionTests(unittest.TestCase):
+ def test_lookup_details_count_only_failed_actions_and_remain_unknown_for_old_logs(self):
+  from source_evidence import summarize_events
+  rows=[dict(kind='action',executed=False,targetResolution={'reason':'no_hittable_target','lookups':[{'reason':'not_hittable'},{'reason':'no_live_match'}]}),
+        dict(kind='action',executed=False,targetResolution={'reason':'query_timeout','lookups':[{'reason':'query_timeout'}]}),
+        dict(kind='action',executed=True,targetResolution={'reason':'matched','lookups':[{'reason':'matched'},{'reason':'no_live_match'}]}),
+        dict(kind='summary',executed=1,rejected=2)]
+  result=summarize_events(rows)
+  self.assertEqual(result['targetResolutionReasons'],{'no_hittable_target':1,'query_timeout':1})
+  self.assertEqual(result['liveLookupReasons'],{'not_hittable':1,'no_live_match':1,'query_timeout':1})
+  old=summarize_events([dict(kind='action',executed=False),dict(kind='summary',executed=0,rejected=1)])
+  self.assertIsNone(old['liveLookupReasons'])

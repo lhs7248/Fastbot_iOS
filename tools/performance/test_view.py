@@ -41,3 +41,15 @@ class FailureEvidenceReportTests(unittest.TestCase):
    report.generate_report(root);page=(root/'report.html').read_text()
    self.assertIn('【探索记录不完整】',page);self.assertIn('已发出操作 未采集',page)
    self.assertIn('导出诊断',page);self.assertNotIn('已发出操作 None',page)
+
+class LookupDetailsReportTests(unittest.TestCase):
+ def test_lookup_failure_reasons_are_readable_and_optional(self):
+  import json
+  with tempfile.TemporaryDirectory() as folder:
+   root=Path(folder)
+   (root/'run-summary.json').write_text(json.dumps({'exploration':{'completed':False,'targetResolutionReasons':{'ambiguous_hittable_targets':1},'liveLookupReasons':{'not_hittable':7,'query_timeout':2}}}))
+   report.generate_report(root);page=(root/'report.html').read_text()
+   self.assertIn('实时控件校验',page)
+   self.assertIn('控件不可点击：7',page)
+   self.assertIn('查询超时：2',page)
+   self.assertIn('多个目标同时可点击：1',page)

@@ -20,17 +20,22 @@ static void appendTree(id node, NSMutableString *out) {
     [out appendString:@"("];
     NSString *kind = s(node[@"kind"]);
     field(out, kind);
+    if (node[@"inputVisible"]) field(out, [node[@"inputVisible"] boolValue] ? @"input-visible" : @"input-hidden");
     field(out, s(node[@"identifier"]));
     BOOL editable = [@[ @"textField", @"secureTextField", @"textView" ] containsObject:kind];
     NSString *label = editable ? @"" : s(node[@"label"]);
-    static NSRegularExpression *dynamic;
+    static NSRegularExpression *dynamic, *clock;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         dynamic = [NSRegularExpression regularExpressionWithPattern:@"^[\\s\\p{N}:.,%+\\-/]+$"
                                                             options:0
                                                               error:nil];
+        clock = [NSRegularExpression regularExpressionWithPattern:@"^\\s*\\p{N}{1,2}:\\p{N}{2}(:\\p{N}{2})?\\s*$" options:0 error:nil];
     });
-    if (label.length && [dynamic firstMatchInString:label options:0 range:NSMakeRange(0, label.length)])
+    BOOL nativeAction=[@[@"button",@"cell",@"link",@"switch"] containsObject:kind];
+    BOOL clockLabel=label.length && [clock firstMatchInString:label options:0 range:NSMakeRange(0,label.length)];
+    if (label.length && (!nativeAction || clockLabel) &&
+        [dynamic firstMatchInString:label options:0 range:NSMakeRange(0, label.length)])
         label = @"#dynamic-number";
     field(out, label);
     field(out, [node[@"selected"] boolValue] ? @"selected" : @"unselected");
@@ -78,9 +83,13 @@ static NSString *operationKey(NSDictionary *a) {
 }
 @interface FBExplorationGuard ()
 @property(nonatomic, copy, readwrite) NSString *fingerprint;
-@property(nonatomic, readwrite) NSUInteger noEffectCount, progressCount, blockedCount;
+@property(nonatomic, readwrite) NSUInteger noEffectCount, progressCount, blockedCount, stalledRejectionCount;
 @property(nonatomic, strong) NSMutableDictionary<NSString *, NSMutableDictionary *> *blocked;
 @property(nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *noEffects, *transitions;
+@property(nonatomic, strong) NSMutableSet<NSString *> *permanentBlocks;
+@property(nonatomic, strong) NSMutableSet<NSString *> *seenFingerprints;
+@property(nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *transientRejections;
+@property(nonatomic) NSUInteger discoveriesSincePass;
 @property(nonatomic, strong) NSDictionary *pending;
 @property(nonatomic, copy) NSString *exhaustionFingerprint;
 @property(nonatomic) NSTimeInterval exhaustionStarted;
@@ -93,6 +102,9 @@ static NSString *operationKey(NSDictionary *a) {
         _blocked = [NSMutableDictionary dictionary];
         _noEffects = [NSMutableDictionary dictionary];
         _transitions = [NSMutableDictionary dictionary];
+        _permanentBlocks = [NSMutableSet set];
+        _seenFingerprints = [NSMutableSet set];
+        _transientRejections = [NSMutableDictionary dictionary];
     }
     return self;
 }
@@ -115,6 +127,10 @@ static NSString *operationKey(NSDictionary *a) {
     NSMutableString *tree = [NSMutableString string];
     appendTree(normalized, tree);
     self.fingerprint = digest(tree);
+    if (![self.seenFingerprints containsObject:self.fingerprint]) {
+        [self.seenFingerprints addObject:self.fingerprint];
+        self.discoveriesSincePass++;
+    }
     NSDictionary *pending = self.pending;
     self.pending = nil;
     if (!pending)
@@ -124,6 +140,7 @@ static NSString *operationKey(NSDictionary *a) {
     BOOL changed = ![before isEqual:self.fingerprint];
     BOOL block = NO;
     if (changed) {
+        [self.noEffects removeObjectForKey:pair];
         self.progressCount++;
         NSString *transition = [pair stringByAppendingFormat:@"|%@", self.fingerprint];
         NSUInteger count = [self.transitions[transition] unsignedIntegerValue] + 1;
@@ -134,6 +151,7 @@ static NSString *operationKey(NSDictionary *a) {
         NSUInteger count = [self.noEffects[pair] unsignedIntegerValue] + 1;
         self.noEffects[pair] = @(count);
         block = count >= 2;
+        if (block) [self.permanentBlocks addObject:pair];
     }
     if (block)
         [self block:a fingerprint:before];
@@ -146,14 +164,26 @@ static NSString *operationKey(NSDictionary *a) {
         @"afterFingerprint" : self.fingerprint
     };
 }
+- (NSString *)exhaustionContextForCandidates:(NSArray *)candidates canGoBack:(BOOL)canGoBack {
+    NSMutableSet *keys=[NSMutableSet set];
+    for (NSDictionary *action in [self availableOperations:candidates]) [keys addObject:operationKey(action)];
+    if (canGoBack) [keys addObject:operationKey(@{@"act":@"BACK"})];
+    NSMutableString *context=[NSMutableString string];
+    field(context,self.fingerprint);
+    for (NSString *key in [[keys allObjects] sortedArrayUsingSelector:@selector(compare:)]) field(context,key);
+    return digest(context);
+}
 - (BOOL)confirmExhaustion:(BOOL)exhausted atTime:(NSTimeInterval)time {
+    return [self confirmExhaustion:exhausted atTime:time context:self.fingerprint];
+}
+- (BOOL)confirmExhaustion:(BOOL)exhausted atTime:(NSTimeInterval)time context:(NSString *)context {
     if (!exhausted) {
         self.exhaustionFingerprint = nil;
         self.exhaustionChecks = 0;
         return NO;
     }
-    if (![self.exhaustionFingerprint isEqualToString:self.fingerprint]) {
-        self.exhaustionFingerprint = self.fingerprint;
+    if (![self.exhaustionFingerprint isEqualToString:context]) {
+        self.exhaustionFingerprint = context;
         self.exhaustionStarted = time;
         self.exhaustionChecks = 1;
         return NO;
@@ -162,13 +192,27 @@ static NSString *operationKey(NSDictionary *a) {
 }
 - (void)recordAction:(NSDictionary *)action executed:(BOOL)executed reason:(NSString *)reason {
     self.pending = nil;
+    self.stalledRejectionCount = executed ? 0 : self.stalledRejectionCount + 1;
     NSDictionary *a = operation(action);
     if (!a)
         return;
-    if (executed)
+    NSString *pair = [self keyFor:a fingerprint:self.fingerprint];
+    if (executed) {
+        [self.transientRejections removeObjectForKey:pair];
         self.pending = @{@"action" : a, @"before" : self.fingerprint};
-    else
+    } else {
+        // A rejected unblocked operation spends a finite attempt or removes a
+        // candidate. Only repeated blocked/unsupported selections are a stall.
+        if (self.blocked[self.fingerprint][operationKey(a)]) return;
+        self.stalledRejectionCount = 0;
+        if ([reason isEqual:@"target_stale_or_not_hittable"]) {
+            NSUInteger failures = [self.transientRejections[pair] unsignedIntegerValue] + 1;
+            self.transientRejections[pair] = @(failures);
+            if (failures < 2) return;
+        }
+        [self.permanentBlocks addObject:[self keyFor:a fingerprint:self.fingerprint]];
         [self block:a fingerprint:self.fingerprint];
+    }
 }
 - (NSArray *)availableOperations:(NSArray *)candidates {
     NSMutableArray *ops = [NSMutableArray array];
@@ -202,6 +246,21 @@ static NSString *operationKey(NSDictionary *a) {
     NSMutableArray *out = [NSMutableArray array];
     for (NSString *key in [[page allKeys] sortedArrayUsingSelector:@selector(compare:)])
         [out addObject:page[key]];
+    // XML class controls the core action pool; enforce the declared native axes
+    // again here so unsupported directions cannot consume real gestures.
+    NSMutableSet *keys = [NSMutableSet set];
+    for (NSDictionary *entry in out) [keys addObject:operationKey(entry)];
+    for (NSDictionary *candidate in candidates) {
+        if (![candidate[@"scrollable"] boolValue] ||
+            ![candidate[@"scrollDirections"] isKindOfClass:NSArray.class]) continue;
+        for (NSString *direction in @[@"SCROLL_TOP_DOWN",@"SCROLL_BOTTOM_UP",@"SCROLL_LEFT_RIGHT",@"SCROLL_RIGHT_LEFT"]) {
+            if ([candidate[@"scrollDirections"] containsObject:direction]) continue;
+            NSDictionary *entry=operation(@{@"act":direction,@"pos":candidate[@"bounds"] ?: @[]});
+            if (entry && ![keys containsObject:operationKey(entry)]) {
+                [out addObject:entry]; [keys addObject:operationKey(entry)];
+            }
+        }
+    }
     return out;
 }
 - (BOOL)hasAvailableActionForCandidates:(NSArray *)candidates canGoBack:(BOOL)canGoBack {
@@ -213,7 +272,37 @@ static NSString *operationKey(NSDictionary *a) {
             return YES;
     return NO;
 }
+- (NSUInteger)beginNextPassForCandidates:(NSArray *)candidates canGoBack:(BOOL)canGoBack {
+    if (!self.discoveriesSincePass) return 0;
+    BOOL currentExit = NO;
+    NSMutableArray *current=[[self availableOperations:candidates] mutableCopy];
+    if (canGoBack) [current addObject:@{@"act":@"BACK"}];
+    for (NSDictionary *action in current)
+        if (self.blocked[self.fingerprint][operationKey(action)] &&
+            ![self.permanentBlocks containsObject:[self keyFor:action fingerprint:self.fingerprint]]) currentExit = YES;
+    if (!currentExit) return 0; // Reopening another page cannot escape this context.
+    NSUInteger reopened = 0;
+    for (NSString *fp in self.blocked.allKeys) {
+        NSMutableDictionary *page = self.blocked[fp];
+        for (NSString *key in page.allKeys) {
+            if (![self.permanentBlocks containsObject:[self keyFor:page[key] fingerprint:fp]]) {
+                [page removeObjectForKey:key];
+                reopened++;
+            }
+        }
+    }
+    if (reopened) {
+        self.discoveriesSincePass = 0;
+        [self.transitions removeAllObjects];
+        [self confirmExhaustion:NO atTime:0];
+    }
+    return reopened;
+}
 - (void)clearPending {
     self.pending = nil;
+    self.stalledRejectionCount = 0;
+    // Recovery starts a fresh observation window even when launch returns to
+    // exactly the same tree. Keep action blocks to avoid replaying dead ends.
+    [self confirmExhaustion:NO atTime:0];
 }
 @end

@@ -36,6 +36,17 @@ class SourceClockTests(unittest.TestCase):
   start=dt.datetime.fromisoformat('2026-10-22T00:00:00+00:00')
   elapsed,age,error=source_timing({'timestamp':'2026-10-22T00:00:10.500000+00:00'},start,10,5)
   self.assertEqual(error,'future_source_sample');self.assertLessEqual(elapsed,10)
+ def test_millisecond_clock_skew_is_bounded_and_auditable(self):
+  import datetime as dt
+  start=dt.datetime.fromisoformat('2026-10-22T00:00:00+00:00')
+  for lead in [.000262,.000863,.001767,.05]:
+   stamp=(start+dt.timedelta(seconds=10+lead)).isoformat()
+   elapsed,age,error=source_timing({'timestamp':stamp},start,10,5)
+   self.assertIsNone(error);self.assertEqual(elapsed,10)
+   self.assertAlmostEqual(age,-lead,places=6)
+  for lead in [.050001,.5,60]:
+   stamp=(start+dt.timedelta(seconds=10+lead)).isoformat()
+   self.assertEqual(source_timing({'timestamp':stamp},start,10,5)[2],'future_source_sample')
  def test_future_sample_is_invalid(self):
   import datetime as dt
   start=dt.datetime.fromisoformat('2026-10-22T00:00:00+00:00')

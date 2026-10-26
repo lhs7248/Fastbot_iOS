@@ -85,6 +85,8 @@ def render_report(run, monitor, collector, summary, issues, rows, root):
     quality = '有效采样 %d / 预计 %d 个，最长未采到数据的时段为 %.1f 秒。'%(summary['validSampleCount'],summary['expectedSampleCount'],summary['maxGapSeconds'])
     if collector.get('warmupSeconds') is not None:
         quality += ' 采集预热 %.1f 秒，就绪后才启动本轮测试；底层每 %s 秒读取，按设定周期保留真实样本，进程切换额外保留边界点。' % (collector['warmupSeconds'], collector.get('sourceIntervalSeconds', '?'))
+    if collector.get('clockCorrections'):
+        quality += ' 时钟微偏差校正 %d 次，最大 %.3f 毫秒（容差 %.0f 毫秒）；保留原始时间，校正后的时间不晚于接收时间。' % (collector['clockCorrections'], collector.get('maxClockCorrectionSeconds', 0)*1000, collector.get('clockLeadToleranceSeconds', .05)*1000)
     quality += ' 曲线空白表示缺少采样，不代表内存为 0。进程切换处不连线。'
     segments=''.join('<tr><td>%s</td><td>%s</td><td>%d</td><td>%.1f</td><td>%.1f</td><td>%.1f</td></tr>'%(s['segmentId'],s['pid'],s['sampleCount'],s['baselineBytes']/MIB,s['peakBytes']/MIB,s['endBytes']/MIB) for s in from_report)
     exploration_html=''
@@ -98,6 +100,8 @@ def render_report(run, monitor, collector, summary, issues, rows, root):
                '未观测到变化 '+observed('noEffectCount'),
                '已屏蔽动作 '+observed('blockedActionCount'),
                '恢复次数 '+observed('recoveries')]
+        if exploration.get('observedContextCount') is not None:
+            parts += ['控件树上下文 '+observed('observedContextCount'), '返回已有上下文 '+observed('revisitedContextTransitions')+' 次', '连续无变化最长 '+observed('maxConsecutiveNoEffect')+' 次', '有效路径回访轮次 '+observed('explorationPassCount')]
         reason={'no_progress_exhausted':'候选动作耗尽，已停止重复操作',
                 'consecutive_rejections':'目标持续无法执行，已停止',
                 'external_js_error':'因 JS 异常停止，已保存探索现场',
@@ -110,7 +114,20 @@ def render_report(run, monitor, collector, summary, issues, rows, root):
         status_text = {'complete':'探索记录已完整保存', 'recovered_partial':'探索记录部分恢复，尾部可能缺失', 'unavailable':'探索记录未取回，不能判断操作总数'}.get(exploration.get('evidenceStatus'),'')
         if status_text: parts.append(status_text)
         if exploration.get('xcresultAvailable') is False: parts.append('Xcode结果包不可用；探索记录已从独立日志恢复' if exploration.get('evidenceSource') == 'device_journal' else 'Xcode结果包不可用；独立日志也未取回')
-        exploration_html='<h2>探索效果</h2><p class="note">'+esc(' · '.join(parts))+('<br>'+esc(reason) if reason else '')+'<br>界面变化不等于业务成功；没有变化也不一定是业务失败。结束前最后一次操作可能尚未观测。</p>'
+        exploration_html='<h2>探索效果</h2><p class="note">'+esc(' · '.join(parts))+('<br>'+esc(reason) if reason else '')+'<br>界面变化不等于业务成功，也不等于新增覆盖；控件树上下文数量不是业务页面覆盖率。没有变化也不一定是业务失败。结束前最后一次操作可能尚未观测。</p>'
+        resolution = exploration.get('targetResolutionReasons')
+        lookups = exploration.get('liveLookupReasons')
+        if isinstance(resolution,dict) or isinstance(lookups,dict):
+            labels = {'query_timeout':'查询超时', 'group_timeout':'整组查询超时',
+                      'query_limit':'查询数量超限', 'snapshot_failed':'实时快照失败',
+                      'no_live_match':'未找到匹配控件', 'live_match_count_mismatch':'匹配数量不一致',
+                      'not_hittable':'控件不可点击', 'ambiguous_hittable_targets':'多个目标同时可点击',
+                      'lookup_incomplete':'查询未完成'}
+            details = [labels.get(key,key)+'：'+str(value) for key,value in (lookups or {}).items()]
+            details += [labels[key]+'：'+str(value) for key,value in (resolution or {}).items()
+                        if key in ('ambiguous_hittable_targets','group_timeout','lookup_incomplete')]
+            exploration_html += '<h2>实时控件校验</h2><p class="note">'+esc(' · '.join(details) or '未记录具体失败原因')+'<br>按查询记录计数，同一次操作可能包含多个查询；仅统计执行失败的操作。</p>'
+
     files=[]
     for name in ['performance/memory.csv','performance/summary.json','issues.json','monitor/fastbot.log','monitor/report.json','performance/samples.jsonl','run-summary.json','exploration/summary.json','exploration/exploration.jsonl','exploration/last-tree.xml','exploration/export-status.json']:
         path=root/name

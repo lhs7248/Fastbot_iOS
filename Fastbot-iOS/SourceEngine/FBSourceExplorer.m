@@ -46,28 +46,36 @@ static NSString *FBKind(XCUIElementType type) {
     }
 }
 // One remote snapshot, then local traversal. Do not query every live node separately.
-static NSDictionary *FBNormalize(id<XCUIElementSnapshot> node, NSUInteger depth, NSUInteger *remaining) {
-    if (!node || depth > 60 || *remaining == 0)
+static NSDictionary *FBNormalize(id<XCUIElementSnapshot> node, NSUInteger depth, NSUInteger *remaining, NSArray *nativePath, BOOL *inputVisible, NSArray *viewport) {
+    if (!node || ![FBTreeAdapter consumeSnapshotNodeAtDepth:depth remaining:remaining])
         return nil;
-    --*remaining;
     NSArray *rawChildren = node.children;
     NSMutableArray *childHints = [NSMutableArray array];
-    for (id<XCUIElementSnapshot> child in rawChildren)
-        [childHints addObject:@{@"identifier": child.identifier ?: @""}];
-    if ([FBTreeAdapter isSystemInputContainer:@{@"kind":FBKind(node.elementType),
-            @"identifier":node.identifier ?: @"", @"children":childHints}])
-        return nil;
+    for (id<XCUIElementSnapshot> child in rawChildren) {
+        CGRect childFrame=child.frame;
+        [childHints addObject:@{@"identifier": child.identifier ?: @"",
+            @"frame":@[@(childFrame.origin.x),@(childFrame.origin.y),@(childFrame.size.width),@(childFrame.size.height)]}];
+    }
     CGRect f = node.frame;
+    NSDictionary *hint=@{@"kind":FBKind(node.elementType), @"identifier":node.identifier ?: @"",
+        @"children":childHints, @"frame":@[@(f.origin.x),@(f.origin.y),@(f.size.width),@(f.size.height)]};
+    if ([FBTreeAdapter isSystemInputContainer:hint]) {
+        // Preserve only context, never keyboard labels, suggestions or input values.
+        if ([FBTreeAdapter inputVisibleForPrunedNode:hint viewport:viewport]) *inputVisible = YES;
+        return nil;
+    }
     BOOL secure = node.elementType == XCUIElementTypeSecureTextField;
     NSMutableArray *children = [NSMutableArray array];
+    NSUInteger childIndex = 0;
     for (id<XCUIElementSnapshot> child in rawChildren) {
-        NSDictionary *desc = FBNormalize(child, depth + 1, remaining);
+        NSDictionary *desc = FBNormalize(child, depth + 1, remaining, [nativePath arrayByAddingObject:@(childIndex++)], inputVisible, viewport);
         if (desc)
             [children addObject:desc];
     }
     // Input values never enter XML or persisted snapshots.
     return @{
         @"type" : @(node.elementType),
+        @"nativePath" : nativePath,
         @"kind" : FBKind(node.elementType),
         @"identifier" : node.identifier ?: @"",
         @"label" : secure ? @"" : (node.label ?: @""),
@@ -92,37 +100,56 @@ static BOOL FBAllowAlert(XCUIElement *alert) {
     }
     return NO;
 }
-static XCUIElement *FBFreshTarget(XCUIApplication *app, NSDictionary *target) {
+static XCUIElement *FBFreshSingleTarget(XCUIApplication *app, NSDictionary *target, NSTimeInterval groupDeadline, NSMutableDictionary *diagnostic) {
+    diagnostic[@"complete"]=@NO;
+    diagnostic[@"expectedMatches"]=target[@"liveMatchCount"] ?: @0;
+    diagnostic[@"matches"]=@0;
+    diagnostic[@"inspected"]=@0;
+    if (CACurrentMediaTime() >= groupDeadline) { diagnostic[@"reason"]=@"group_timeout"; return nil; }
     XCUIElementQuery *query = [app descendantsMatchingType:[target[@"type"] unsignedIntegerValue]];
     NSString *identifier = target[@"identifier"], *label = target[@"label"];
-    if (identifier.length)
-        query = [query matchingIdentifier:identifier];
-    else if (label.length)
-        query = [query matchingPredicate:[NSPredicate predicateWithFormat:@"label == %@", label]];
+    query = [query matchingPredicate:[FBTreeAdapter livePredicateForTarget:target]];
     XCUIElement *match = nil;
     NSUInteger matches = 0, inspected = 0;
-    NSTimeInterval lookupDeadline = CACurrentMediaTime() + 4;
+    NSTimeInterval lookupDeadline = MIN(groupDeadline, CACurrentMediaTime() + (label.length || identifier.length ? 4 : 12));
     for (XCUIElement *element in query.allElementsBoundByIndex) {
-        if (++inspected > 32 || CACurrentMediaTime() > lookupDeadline)
-            return nil; // Broad/slow queries must not consume the exploration budget.
-        if (!element.exists || !element.enabled)
-            continue;
-        CGRect f = element.frame;
-        if (![FBTreeAdapter target:target
-                 matchesLiveBounds:@[
-                     @(f.origin.x), @(f.origin.y), @(CGRectGetMaxX(f)), @(CGRectGetMaxY(f))
-                 ]])
-            continue;
-        ++matches;
-        // RN can expose the same text twice in an ancestor/leaf pair. The snapshot
-        // must predict the exact number of geometrically equivalent live matches.
-        if (element.hittable)
-            match = element;
+        diagnostic[@"inspected"]=@(++inspected);
+        if (CACurrentMediaTime() > lookupDeadline) { diagnostic[@"reason"]=@"query_timeout"; return nil; }
+        if (inspected > (label.length || identifier.length ? 32 : 256)) { diagnostic[@"reason"]=@"query_limit"; return nil; }
+        id<XCUIElementSnapshot> live = [element snapshotWithError:nil];
+        if (!live) { diagnostic[@"reason"]=@"snapshot_failed"; return nil; }
+        if (!live.enabled) continue;
+        CGRect f = live.frame;
+        if (![FBTreeAdapter target:target matchesLiveBounds:@[
+                @(f.origin.x), @(f.origin.y), @(CGRectGetMaxX(f)), @(CGRectGetMaxY(f))]]) continue;
+        diagnostic[@"matches"]=@(++matches);
+        // Same-identity RN ancestor/leaf pairs must agree with the snapshot count.
+        if (element.hittable) match = element;
     }
+    // Native calls cannot be preempted; never treat an over-budget scan as complete.
+    if (CACurrentMediaTime() > lookupDeadline) { diagnostic[@"reason"]=@"query_timeout"; return nil; }
+    if (matches>0 && matches != [target[@"liveMatchCount"] unsignedIntegerValue]) {
+        diagnostic[@"reason"]=@"live_match_count_mismatch"; return nil;
+    }
+    diagnostic[@"complete"]=@YES;
+    diagnostic[@"reason"]=matches==0 ? @"no_live_match" : match ? @"matched" : @"not_hittable";
     return matches == [target[@"liveMatchCount"] unsignedIntegerValue] ? match : nil;
 }
+static XCUIElement *FBFreshTarget(XCUIApplication *app, NSDictionary *target, NSDictionary **resolved, NSMutableDictionary *diagnostic) {
+    NSArray *alternatives=target[@"alternatives"] ?: @[target];
+    NSTimeInterval deadline=CACurrentMediaTime()+12;
+    NSDictionary *result=[FBTreeAdapter uniqueLiveTargetForCandidates:alternatives lookup:^NSDictionary *(NSDictionary *candidate) {
+        NSMutableDictionary *status=[NSMutableDictionary dictionary];
+        XCUIElement *element=FBFreshSingleTarget(app,candidate,deadline,status);
+        if (element) status[@"element"]=element;
+        return status;
+    } diagnostics:diagnostic];
+    if (CACurrentMediaTime() >= deadline) { diagnostic[@"reason"]=@"group_timeout"; return nil; }
+    if (resolved) *resolved=result[@"candidate"];
+    return result[@"element"];
+}
 static XCUIElement *FBBackButton(XCUIApplication *app) {
-    for (NSString *label in @[ @"返回", @"Back", @"后退" ]) {
+    for (NSString *label in @[ @"返回", @"Back", @"后退", @"关闭", @"Close", @"取消", @"Cancel", @"完成", @"Done" ]) {
         XCUIElementQuery *q =
             [app.buttons matchingPredicate:[NSPredicate predicateWithFormat:@"label == %@", label]];
         if (q.count == 1 && q.firstMatch.enabled && q.firstMatch.hittable)
@@ -130,11 +157,20 @@ static XCUIElement *FBBackButton(XCUIApplication *app) {
     }
     return nil;
 }
-static BOOL FBBack(XCUIApplication *app) {
+static BOOL FBBack(XCUIApplication *app, NSString *gesture) {
     XCUIElement *button = FBBackButton(app);
-    if (!button)
-        return NO;
-    [button tap];
+    if (button) {
+        [button tap];
+        return YES;
+    }
+    if (!app.exists || app.state != XCUIApplicationStateRunningForeground || CGRectIsEmpty(app.frame)) return NO;
+    if ([gesture isEqualToString:@"preview_tap"]) {
+        [app tap];
+    } else {
+        XCUICoordinate *edge = [app coordinateWithNormalizedOffset:CGVectorMake(0.01, 0.5)];
+        [edge pressForDuration:0.1 thenDragToCoordinate:
+            [app coordinateWithNormalizedOffset:CGVectorMake(0.8, 0.5)]];
+    }
     return YES;
 }
 static void FBAudit(NSFileHandle *file, NSDictionary *event) {
@@ -202,7 +238,7 @@ static void FBAudit(NSFileHandle *file, NSDictionary *event) {
     NSUInteger steps = 0, rejected = 0, failures = 0, recoveries = 0;
     BOOL success = NO, selectionExhausted = NO;
     NSString *stopReason = @"time_budget";
-    NSString *selectionExhaustedFingerprint = nil;
+    NSString *selectionExhaustedContext = nil;
     NSString *lastXML = nil;
     NSMutableSet *diagnosticPages = [NSMutableSet set];
     NSTimeInterval deadline = CACurrentMediaTime() + minutes * 60;
@@ -239,10 +275,15 @@ static void FBAudit(NSFileHandle *file, NSDictionary *event) {
                 NSTimeInterval started = CACurrentMediaTime();
                 id<XCUIElementSnapshot> snapshot = [app snapshotWithError:&snapshotError];
                 NSUInteger remaining = 5000;
-                NSDictionary *normalized = FBNormalize(snapshot, 0, &remaining);
+                BOOL inputVisible = NO;
+                CGRect viewportFrame=snapshot.frame;
+                NSArray *viewport=@[@(viewportFrame.origin.x),@(viewportFrame.origin.y),@(viewportFrame.size.width),@(viewportFrame.size.height)];
+                NSMutableDictionary *normalized = [FBNormalize(snapshot, 0, &remaining, @[], &inputVisible, viewport) mutableCopy];
+                if (normalized) normalized[@"inputVisible"] = @(inputVisible);
                 NSDictionary *page =
                     normalized ? [FBTreeAdapter pageFromSnapshot:normalized bundleID:bundle] : nil;
                 if (normalized && remaining > 0) {
+                    failures = 0;
                     NSDictionary *effect = [guard observeSnapshot:normalized];
                     if (effect)
                         FBAudit(audit, effect);
@@ -252,7 +293,8 @@ static void FBAudit(NSFileHandle *file, NSDictionary *event) {
                     lastXML = page[@"xml"];
                     NSDictionary *checkpoint = @{@"xml":lastXML, @"pageKey":page[@"pageKey"],
                         @"fingerprint":guard.fingerprint, @"nodeCount":page[@"nodeCount"] ?: @0,
-                        @"timestamp":[[NSISO8601DateFormatter new] stringFromDate:NSDate.date]};
+                        @"timestamp":[[NSISO8601DateFormatter new] stringFromDate:NSDate.date],
+                        @"snapshot":normalized};
                     NSError *checkpointError = nil;
                     NSData *checkpointData = [NSJSONSerialization dataWithJSONObject:checkpoint options:0 error:&checkpointError];
                     if (!checkpointData || ![checkpointData writeToFile:
@@ -263,13 +305,15 @@ static void FBAudit(NSFileHandle *file, NSDictionary *event) {
                         break;
                     }
                 }
-                if (selectionExhausted && ![selectionExhaustedFingerprint isEqual:guard.fingerprint])
+                BOOL canGoBack=app.state == XCUIApplicationStateRunningForeground;
+                NSString *actionContext=[guard exhaustionContextForCandidates:candidates canGoBack:canGoBack];
+                if (selectionExhausted && ![selectionExhaustedContext isEqual:actionContext])
                     selectionExhausted = NO;
                 BOOL exhaustionCandidate = page && remaining > 0 &&
                     (selectionExhausted || ![guard hasAvailableActionForCandidates:candidates
-                        canGoBack:FBBackButton(app) != nil]);
+                        canGoBack:canGoBack]);
                 BOOL confirmedExhaustion = [guard confirmExhaustion:exhaustionCandidate
-                                                               atTime:CACurrentMediaTime()];
+                                                               atTime:CACurrentMediaTime() context:actionContext];
                 if (exhaustionCandidate && !confirmedExhaustion) {
                     FBAudit(audit, @{@"kind":@"settling", @"reason":@"confirm_exhaustion",
                         @"fingerprint":guard.fingerprint, @"candidateCount":@(candidates.count)});
@@ -277,6 +321,13 @@ static void FBAudit(NSFileHandle *file, NSDictionary *event) {
                     continue;
                 }
                 if (confirmedExhaustion) {
+                    NSUInteger reopened = [guard beginNextPassForCandidates:candidates canGoBack:canGoBack];
+                    if (reopened) {
+                        selectionExhausted = NO;
+                        FBAudit(audit, @{@"kind":@"exploration_pass", @"reason":@"revisit_effective_transitions",
+                            @"reopenedActions":@(reopened), @"fingerprint":guard.fingerprint});
+                        continue;
+                    }
                     if (recoveries >= 2) {
                         stopReason = @"no_progress_exhausted";
                         FBAudit(audit, @{
@@ -307,7 +358,7 @@ static void FBAudit(NSFileHandle *file, NSDictionary *event) {
                     [NSThread sleepForTimeInterval:MAX(throttle, 0.5)];
                     continue;
                 }
-                if (!page || !candidates.count || remaining == 0) {
+                if (!page || remaining == 0) {
                     FBAudit(audit, @{
                         @"kind" : @"snapshot_rejected",
                         @"reason" : remaining == 0 ? @"node_limit" : @"no_actionable_elements",
@@ -353,19 +404,22 @@ static void FBAudit(NSFileHandle *file, NSDictionary *event) {
                     break;
                 }
                 NSDictionary *selectedTarget = nil;
+                NSMutableDictionary *targetDiagnostic=[NSMutableDictionary dictionary];
                 NSString *act = action[@"act"];
                 NSString *state = [action[@"sid"] length] ? action[@"sid"] : page[@"pageKey"];
                 BOOL executed = NO;
+                NSString *navigationMethod = nil;
                 NSString *reason = @"unsupported_action";
                 if ([act isEqualToString:@"NOP"] &&
                     [action[@"reason"] isEqualToString:@"no_available_action"]) {
                     selectionExhausted = YES;
-                    selectionExhaustedFingerprint = guard.fingerprint;
+                    selectionExhaustedContext = actionContext;
                     reason = @"no_available_action";
                 }
                 if ([act isEqualToString:@"BACK"]) {
-                    executed = FBBack(app);
-                    reason = @"no_back_button";
+                    navigationMethod = FBBackButton(app) ? @"native_button" : page[@"escapeGesture"];
+                    executed = FBBack(app, page[@"escapeGesture"]);
+                    reason = @"no_native_back_target";
                 } else if ([act isEqualToString:@"ACTIVATE"] || [act isEqualToString:@"START"]) {
                     [app activate];
                     executed = YES;
@@ -375,8 +429,10 @@ static void FBAudit(NSFileHandle *file, NSDictionary *event) {
                     executed = YES;
                 } else {
                     NSDictionary *target = [FBTreeAdapter targetForAction:action candidates:candidates];
+                    NSDictionary *resolvedTarget=nil;
+                    XCUIElement *element = target ? FBFreshTarget(app, target, &resolvedTarget, targetDiagnostic) : nil;
+                    target = resolvedTarget ?: target;
                     selectedTarget = target;
-                    XCUIElement *element = target ? FBFreshTarget(app, target) : nil;
                     if (!selectionExhausted)
                         reason = target ? @"target_stale_or_not_hittable" : @"no_unique_action_target";
                     if (element) {
@@ -419,6 +475,7 @@ static void FBAudit(NSFileHandle *file, NSDictionary *event) {
                     @"nodeCount" : page[@"nodeCount"] ?: @0,
                     @"elapsedMs" : @((CACurrentMediaTime() - started) * 1000)
                 } mutableCopy];
+                if (targetDiagnostic.count) record[@"targetResolution"]=targetDiagnostic;
                 if (selectedTarget) {
                     record[@"targetLabel"] = selectedTarget[@"label"] ?: @"";
                     record[@"recognition"] = selectedTarget[@"recognition"] ?: @"native_role";
@@ -428,8 +485,12 @@ static void FBAudit(NSFileHandle *file, NSDictionary *event) {
                     [NSPredicate predicateWithFormat:@"recognition == %@", @"inferred_label"]] count]);
                 if (action[@"pos"])
                     record[@"bounds"] = action[@"pos"];
+                if ([act isEqualToString:@"BACK"])
+                    record[@"navigationMethod"] = navigationMethod ?: @"unavailable";
                 record[@"beforeFingerprint"] = guard.fingerprint;
                 [guard recordAction:action executed:executed reason:reason];
+                record[@"stalledRejectionCount"] = @(guard.stalledRejectionCount);
+                record[@"blockedActionCount"] = @(guard.blockedCount);
                 FBAudit(audit, record);
                 if (executed) {
                     ++steps;
@@ -437,10 +498,10 @@ static void FBAudit(NSFileHandle *file, NSDictionary *event) {
                     NSLog(@"state %@ action %@ throttle %.2f source=xctest", state, act, throttle);
                 } else {
                     ++rejected;
-                    if (++failures >= 15) {
+                    if (guard.stalledRejectionCount >= 15) {
                         stopReason = @"consecutive_rejections";
                         runError = FBError(
-                            @"15 consecutive rejected actions; refusing blind coordinate fallback");
+                            @"15 rejected selections without eliminating or retrying a fresh candidate");
                         break;
                     }
                 }

@@ -48,7 +48,37 @@ def summarize_events(rows):
     for key, effect in [('noEffectCount', 'no_observable_change'), ('progressCount', 'changed')]:
         if key in finals[0] and finals[0][key] != effects[effect]:
             raise ValueError('Exploration effect summary disagrees with observations')
-    return {**finals[0], 'engine': 'android-reuseq-source', 'treeSource': 'xctest-accessibility',
+    contexts = set()
+    revisited = 0
+    effect_rows = [r for r in rows if r.get('kind') == 'action_effect']
+    streak = longest = 0
+    for row in rows:
+        before = row.get('beforeFingerprint')
+        if isinstance(before, str) and before:
+            contexts.add(before)
+        if row.get('kind') != 'action_effect':
+            continue
+        after = row.get('afterFingerprint')
+        if row.get('effect') == 'changed' and isinstance(after, str) and after:
+            revisited += after in contexts
+        if isinstance(after, str) and after:
+            contexts.add(after)
+        streak = streak + 1 if row.get('effect') == 'no_observable_change' else 0
+        longest = max(longest, streak)
+    rejected_actions = [r for r in actions if r.get('executed') is False]
+    resolutions = [r['targetResolution'] for r in rejected_actions if isinstance(r.get('targetResolution'), dict)]
+    resolution_reasons = collections.Counter(r['reason'] for r in resolutions if isinstance(r.get('reason'), str))
+    lookup_reasons = collections.Counter(
+        item['reason'] for r in resolutions for item in (r.get('lookups') or [])
+        if isinstance(item, dict) and isinstance(item.get('reason'), str) and item['reason'] != 'matched')
+    return {**finals[0],
+            'targetResolutionReasons': dict(resolution_reasons) if resolutions else None,
+            'liveLookupReasons': dict(lookup_reasons) if resolutions else None,
+            'observedContextCount': len(contexts) if contexts else None,
+            'revisitedContextTransitions': revisited if contexts else None,
+            'maxConsecutiveNoEffect': longest if effect_rows else None,
+            'explorationPassCount': sum(r.get('kind') == 'exploration_pass' for r in rows),
+            'engine': 'android-reuseq-source', 'treeSource': 'xctest-accessibility',
             'rejectionReasons': dict(collections.Counter(r.get('reason', 'unknown') for r in actions if r.get('executed') is False)),
             'actionTypes': dict(collections.Counter(r.get('act', 'unknown') for r in actions if r.get('executed') is True))}
 

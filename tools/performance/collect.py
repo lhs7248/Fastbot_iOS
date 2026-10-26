@@ -62,6 +62,10 @@ def source_timing(frame, start_wall, received_elapsed, interval):
     age = received_elapsed - elapsed
     if elapsed < 0:
         return 0, age, 'source_sample_before_capture'
+    # Wall and monotonic clocks can drift by milliseconds. Keep raw timestamp,
+    # clamp only a bounded lead to receipt; never extend the capture into future.
+    if -.050000001 <= age < 0:
+        return received_elapsed, age, None
     if age < 0:
         return received_elapsed, age, 'future_source_sample'
     if age > max(10, interval * 3):
@@ -154,6 +158,8 @@ def main():
     last_saved_elapsed = -1
     last_recorded_elapsed = 0
     child = None
+    clock_corrections = 0
+    max_clock_correction = 0.0
     accepted = raw_valid = attempts = offset = 0
     terminal_failure = None
     with (args.out/'samples.jsonl').open('w') as sink, (args.out/'warmup.jsonl').open('w') as warmup, (args.out/'collector.log').open('w') as log:
@@ -178,7 +184,7 @@ def main():
 
         def consume():
             nonlocal offset, last_source, capture_offset, started_at, last_event_elapsed
-            nonlocal last_valid, raw_valid
+            nonlocal last_valid, raw_valid, clock_corrections, max_clock_correction
             with raw_path.open() as raw:
                 raw.seek(offset)
                 while True:
@@ -205,6 +211,11 @@ def main():
                         if error is None:
                             last_event_elapsed = source_elapsed
                             row = normalize_frame(frame, source_elapsed, tracker)
+                            if age < 0:
+                                row['clockCorrectionSeconds'] = -age
+                                row['timingAdjustment'] = 'bounded_clock_lead_clamped_to_receipt'
+                                clock_corrections += 1
+                                max_clock_correction = max(max_clock_correction, -age)
                         else:
                             row = {'timestamp': frame.get('timestamp') or utc_now(),
                                    'elapsedSeconds': source_elapsed, 'pid': frame.get('pid'),
@@ -289,6 +300,8 @@ def main():
                         'shutdownSeconds': time.monotonic() - shutdown_started,
                         'intervalSeconds': args.interval, 'sourceIntervalSeconds': min(1, args.interval / 3),
                         'validSamples': accepted, 'rawValidSamples': raw_valid,
+                        'clockCorrections': clock_corrections, 'maxClockCorrectionSeconds': max_clock_correction,
+                        'clockLeadToleranceSeconds': .050,
                         'collectorRetries': attempts, 'failure': terminal_failure,
                         'stopReason': 'stopped' if stopped.is_set() else 'failed' if terminal_failure else 'budget_elapsed'}
             (args.out/'collector-summary.json').write_text(json.dumps(metadata, indent=2))
